@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "arch-tech"
+version = "2.0.0"
+description = "Arch Tech — HD Video Streaming Platform by Shashank"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "aiosqlite",
+    "selectolax",
+    "chompjs",
+    "eaf-base-api",
+    "m3u8",
+    "curl_cffi",
+    "python-multipart",
+]
