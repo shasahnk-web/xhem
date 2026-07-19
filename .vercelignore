@@ -1,0 +1,11 @@
+pyproject.toml
+uv.lock
+*.db
+bot.py
+downloads/*.mp4
+__pycache__/
+*.pyc
+.pythonlibs/
+.agents/
+.local/
+replit.md
