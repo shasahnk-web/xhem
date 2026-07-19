@@ -1,14 +1,16 @@
-"""Async SQLite database layer for XStream."""
+"""Async SQLite database layer for Arch Tech."""
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from typing import Any
 
 import aiosqlite
 
-DB_PATH = "xstream.db"
+# On Vercel the filesystem is read-only except /tmp
+DB_PATH = "/tmp/xstream.db" if os.environ.get("VERCEL") else "xstream.db"
 logger = logging.getLogger(__name__)
 
 _CREATE_SQL = """
@@ -179,7 +181,6 @@ async def add_to_favorites(
     video_thumbnail: str | None = None,
     video_duration: str | None = None,
 ) -> bool:
-    """Returns True if newly added, False if already existed."""
     async with aiosqlite.connect(DB_PATH) as db:
         try:
             await db.execute(

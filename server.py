@@ -1,4 +1,4 @@
-"""Arch Tech — FastAPI backend.
+"""Arch Tech — FastAPI backend (Vercel-compatible).
 
 Routes:
   /api/search          — search videos
@@ -6,13 +6,13 @@ Routes:
   /api/trending        — trending / latest / popular
   /api/categories      — category list
   /api/channel         — channel metadata + videos
-  /api/related         — related videos (tag-based search)
+  /api/related         — related videos
   /api/qualities       — probe available HLS qualities
   /api/download-file   — download video as mp4 to browser
   /api/user/*          — history, favorites, bookmarks, settings
   /proxy/m3u8          — rewrite HLS playlist
   /proxy/seg           — proxy TS / fMP4 segments
-  /                    — Web SPA
+  /                    — serves index.html (local dev only; Vercel uses public/)
 """
 
 from __future__ import annotations
@@ -24,21 +24,18 @@ import os
 import random
 import re
 import time
-from contextlib import asynccontextmanager
 from urllib.parse import urljoin, urlparse
-from typing import Annotated
 
 import httpx
-from fastapi import FastAPI, Query, HTTPException, Header
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, FileResponse
+from fastapi.responses import JSONResponse, Response, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 try:
     from base_api.modules.errors import DataNotLoadedError as _DNLE
 except ImportError:
     class _DNLE(Exception):  # type: ignore[no-redef]
-        """Fallback sentinel used only if base_api's error class can't be imported."""
         pass
 
 
@@ -46,11 +43,10 @@ def _sg(obj, attr, default=None):
     """Safe attribute getter — returns default instead of raising DataNotLoadedError."""
     try:
         val = getattr(obj, attr, default)
-        if val is None:
-            return default
-        return val
+        return default if val is None else val
     except _DNLE:
         return default
+
 
 import database as db
 from xhamster_api import Client
@@ -58,7 +54,25 @@ from xhamster_api import Client
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# ── Lazy initialisation (required for Vercel serverless) ─────────────────────
+# Vercel does not reliably fire lifespan/startup events; we init on first use.
+
+_init_lock = asyncio.Lock()
+_initialized = False
 xhclient: Client | None = None
+
+
+async def _ensure_init() -> None:
+    global _initialized, xhclient
+    if _initialized:
+        return
+    async with _init_lock:
+        if _initialized:
+            return
+        await db.init_db()
+        xhclient = Client()
+        _initialized = True
+
 
 # ── SSRF allowlist ────────────────────────────────────────────────────────────
 
@@ -85,17 +99,9 @@ def _guard(url: str) -> None:
         raise HTTPException(400, str(exc)) from exc
 
 
-# ── Lifespan ──────────────────────────────────────────────────────────────────
+# ── App ───────────────────────────────────────────────────────────────────────
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global xhclient
-    await db.init_db()
-    xhclient = Client()
-    yield
-
-
-app = FastAPI(lifespan=lifespan, title="Arch Tech API")
+app = FastAPI(title="Arch Tech API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -123,37 +129,15 @@ def b64dec(s: str) -> str:
 async def _fetch(url: str, timeout: int = 15):
     hdrs = {"Referer": "https://xhamster.com/", "Origin": "https://xhamster.com"}
     try:
-        assert xhclient
-        r = await xhclient.core.session.get(url, headers=hdrs)
-        if r.status_code == 200:
-            return r
+        if xhclient:
+            r = await xhclient.core.session.get(url, headers=hdrs)
+            if r.status_code == 200:
+                return r
     except Exception:
         pass
     async with httpx.AsyncClient(follow_redirects=True, timeout=timeout) as hx:
         r = await hx.get(url, headers=hdrs)
         return r if r.status_code == 200 else None
-
-
-async def _m3u8_duration(m3u8_base: str, quality: str) -> int | None:
-    """Fetch an HLS playlist and sum #EXTINF durations to get total seconds."""
-    try:
-        u = m3u8_base.replace("_TPL_", quality) if "_TPL_" in m3u8_base else m3u8_base
-        _guard(u)
-        r = await _fetch(u)
-        if not r:
-            return None
-        total = 0.0
-        for line in r.text.splitlines():
-            line = line.strip()
-            if line.startswith("#EXTINF:"):
-                val = line[len("#EXTINF:"):].split(",")[0]
-                try:
-                    total += float(val)
-                except ValueError:
-                    pass
-        return round(total) if total > 0 else None
-    except Exception:
-        return None
 
 
 def _video_dict(v) -> dict:
@@ -200,16 +184,13 @@ CATEGORIES = [
 async def api_search(
     q:    str = Query(..., min_length=1),
     page: int = Query(1, ge=1),
-    sort: str = Query("", description="views|newest|best|longest"),
+    sort: str = Query(""),
 ):
-    assert xhclient
+    await _ensure_init()
     results = []
     try:
         async for result in xhclient.search_videos(
-            q,
-            pages=page,
-            load_html=False,
-            sort_by=sort or None,
+            q, pages=page, load_html=False, sort_by=sort or None,
         ):
             try:
                 results.append(_video_dict(result.video))
@@ -230,28 +211,20 @@ _FEED_QUERY_POOL = [
 
 @app.get("/api/trending")
 async def api_trending(
-    sort:     str  = Query("views", description="views|newest|best|longest"),
-    period:   str  = Query("monthly", description="latest|weekly|monthly|yearly"),
+    sort:     str  = Query("views"),
+    period:   str  = Query("monthly"),
     category: str  = Query(""),
     page:     int  = Query(1, ge=1),
     fresh:    bool = Query(False),
 ):
-    assert xhclient
+    await _ensure_init()
     results = []
-    if category:
-        query = category
-    elif fresh:
-        query = random.choice(_FEED_QUERY_POOL)
-    else:
-        query = "amateur"
+    query = category or (random.choice(_FEED_QUERY_POOL) if fresh else "amateur")
     page_to_use = random.randint(1, 3) if fresh else page
     try:
         async for result in xhclient.search_videos(
-            query=query,
-            pages=page_to_use,
-            load_html=False,
-            sort_by=sort or None,
-            date=period or None,
+            query=query, pages=page_to_use, load_html=False,
+            sort_by=sort or None, date=period or None,
         ):
             try:
                 results.append(_video_dict(result.video))
@@ -275,7 +248,7 @@ async def api_categories():
 
 @app.get("/api/video")
 async def api_video(url: str = Query(...)):
-    assert xhclient
+    await _ensure_init()
     try:
         v = await xhclient.get_video(url)
     except Exception as e:
@@ -306,7 +279,7 @@ async def api_video(url: str = Query(...)):
 
 @app.get("/api/related")
 async def api_related(url: str = Query(...)):
-    assert xhclient
+    await _ensure_init()
     results = []
     try:
         v = await xhclient.get_video(url)
@@ -331,7 +304,7 @@ async def api_related(url: str = Query(...)):
 
 @app.get("/api/channel")
 async def api_channel(url: str = Query(...), page: int = Query(1, ge=1)):
-    assert xhclient
+    await _ensure_init()
     try:
         ch = await xhclient.get_channel(url)
         videos = []
@@ -375,7 +348,8 @@ async def api_qualities(url: str = Query(...)):
 
 # ── Download — browser file download ─────────────────────────────────────────
 
-DOWNLOAD_DIR = "downloads"
+# Writable tmp dir on both Vercel and local
+DOWNLOAD_DIR = "/tmp/downloads" if os.environ.get("VERCEL") else "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 _active_downloads: set[int] = set()
@@ -389,9 +363,8 @@ async def api_download_file(
     quality: str = Query("240p"),
     user_id: int = Query(0),
 ):
-    """Download a video as an mp4 file delivered directly to the browser."""
+    await _ensure_init()
     from base_api.modules.config import DownloadConfigHLS
-    assert xhclient
 
     now = time.time()
     if user_id and user_id in _active_downloads:
@@ -406,15 +379,15 @@ async def api_download_file(
             _last_download_at[user_id] = now
 
         v = await xhclient.get_video(url)
-        title = _sg(v, "title", "video") or "video"
+        title    = _sg(v, "title", "video") or "video"
         video_id = _sg(v, "video_id", str(int(time.time())))
-        m3u8 = _sg(v, "m3u8_base_url")
+        m3u8     = _sg(v, "m3u8_base_url")
         if not m3u8:
             raise HTTPException(502, "No stream found for this video.")
 
         safe_title = re.sub(r'[^\w\s-]', '', title)[:60].strip().replace(' ', '_')
-        filename = f"{safe_title or video_id}.mp4"
-        path = os.path.join(DOWNLOAD_DIR, f"{video_id}_{int(time.time())}.mp4")
+        filename   = f"{safe_title or video_id}.mp4"
+        path       = os.path.join(DOWNLOAD_DIR, f"{video_id}_{int(time.time())}.mp4")
 
         config = DownloadConfigHLS(
             quality=quality or "240p",
@@ -426,30 +399,25 @@ async def api_download_file(
         if not ok or not os.path.exists(path):
             raise HTTPException(502, "Could not download this video — try a lower quality.")
 
-        # Stream file back to browser then delete
-        def cleanup():
-            try:
-                if path and os.path.exists(path):
-                    os.remove(path)
-            except OSError:
-                pass
-
         return FileResponse(
             path,
             media_type="video/mp4",
             filename=filename,
-            background=None,
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
     except HTTPException:
         if path and os.path.exists(path):
-            try: os.remove(path)
-            except OSError: pass
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         raise
     except Exception as e:
         if path and os.path.exists(path):
-            try: os.remove(path)
-            except OSError: pass
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         raise HTTPException(502, str(e))
     finally:
         if user_id:
@@ -460,6 +428,7 @@ async def api_download_file(
 
 @app.post("/api/user/upsert")
 async def upsert_user_endpoint(data: dict):
+    await _ensure_init()
     uid = data.get("user_id")
     if not uid:
         raise HTTPException(400, "user_id required")
@@ -471,24 +440,31 @@ async def upsert_user_endpoint(data: dict):
 
 @app.get("/api/user/history")
 async def get_history(user_id: int = Query(...), limit: int = 20, offset: int = 0):
+    await _ensure_init()
     return JSONResponse(await db.get_history(user_id, limit, offset))
 
 
 @app.post("/api/user/history")
 async def post_history(data: dict):
+    await _ensure_init()
     uid = data.get("user_id")
-    if not uid: raise HTTPException(400, "user_id required")
+    if not uid:
+        raise HTTPException(400, "user_id required")
     await db.upsert_user(uid)
-    await db.add_to_history(uid, data["video_url"], data.get("video_title"),
-                            data.get("video_thumbnail"), data.get("video_duration"),
-                            data.get("watch_position", 0))
+    await db.add_to_history(
+        uid, data["video_url"], data.get("video_title"),
+        data.get("video_thumbnail"), data.get("video_duration"),
+        data.get("watch_position", 0),
+    )
     return JSONResponse({"ok": True})
 
 
 @app.put("/api/user/progress")
 async def update_progress(data: dict):
+    await _ensure_init()
     uid = data.get("user_id")
-    if not uid: raise HTTPException(400, "user_id required")
+    if not uid:
+        raise HTTPException(400, "user_id required")
     await db.upsert_user(uid)
     await db.add_to_history(uid, data["video_url"], watch_position=data.get("position", 0))
     return JSONResponse({"ok": True})
@@ -496,12 +472,14 @@ async def update_progress(data: dict):
 
 @app.get("/api/user/progress")
 async def get_progress(user_id: int = Query(...), video_url: str = Query(...)):
+    await _ensure_init()
     pos = await db.get_watch_position(user_id, video_url)
     return JSONResponse({"position": pos})
 
 
 @app.delete("/api/user/history")
 async def clear_history(user_id: int = Query(...)):
+    await _ensure_init()
     await db.clear_history(user_id)
     return JSONResponse({"ok": True})
 
@@ -510,27 +488,34 @@ async def clear_history(user_id: int = Query(...)):
 
 @app.get("/api/user/favorites")
 async def get_favorites(user_id: int = Query(...), limit: int = 20, offset: int = 0):
+    await _ensure_init()
     return JSONResponse(await db.get_favorites(user_id, limit, offset))
 
 
 @app.post("/api/user/favorites")
 async def add_favorite(data: dict):
+    await _ensure_init()
     uid = data.get("user_id")
-    if not uid: raise HTTPException(400, "user_id required")
+    if not uid:
+        raise HTTPException(400, "user_id required")
     await db.upsert_user(uid)
-    added = await db.add_to_favorites(uid, data["video_url"], data.get("video_title"),
-                                      data.get("video_thumbnail"), data.get("video_duration"))
+    added = await db.add_to_favorites(
+        uid, data["video_url"], data.get("video_title"),
+        data.get("video_thumbnail"), data.get("video_duration"),
+    )
     return JSONResponse({"ok": True, "added": added})
 
 
 @app.delete("/api/user/favorites")
 async def remove_favorite(user_id: int = Query(...), video_url: str = Query(...)):
+    await _ensure_init()
     removed = await db.remove_from_favorites(user_id, video_url)
     return JSONResponse({"ok": True, "removed": removed})
 
 
 @app.get("/api/user/is_favorite")
 async def check_favorite(user_id: int = Query(...), video_url: str = Query(...)):
+    await _ensure_init()
     return JSONResponse({"is_favorite": await db.is_favorite(user_id, video_url)})
 
 
@@ -538,13 +523,16 @@ async def check_favorite(user_id: int = Query(...), video_url: str = Query(...))
 
 @app.get("/api/user/bookmarks")
 async def get_bookmarks(user_id: int = Query(...)):
+    await _ensure_init()
     return JSONResponse(await db.get_bookmarks(user_id))
 
 
 @app.post("/api/user/bookmarks")
 async def add_bookmark(data: dict):
+    await _ensure_init()
     uid = data.get("user_id")
-    if not uid: raise HTTPException(400, "user_id required")
+    if not uid:
+        raise HTTPException(400, "user_id required")
     await db.upsert_user(uid)
     await db.add_bookmark(uid, data["video_url"], data.get("video_title"), data.get("position", 0))
     return JSONResponse({"ok": True})
@@ -552,6 +540,7 @@ async def add_bookmark(data: dict):
 
 @app.delete("/api/user/bookmarks")
 async def remove_bookmark(user_id: int = Query(...), video_url: str = Query(...)):
+    await _ensure_init()
     await db.remove_bookmark(user_id, video_url)
     return JSONResponse({"ok": True})
 
@@ -560,18 +549,22 @@ async def remove_bookmark(user_id: int = Query(...), video_url: str = Query(...)
 
 @app.get("/api/user/stats")
 async def user_stats(user_id: int = Query(...)):
+    await _ensure_init()
     return JSONResponse(await db.get_user_stats(user_id))
 
 
 @app.get("/api/user/settings")
 async def user_settings(user_id: int = Query(...)):
+    await _ensure_init()
     return JSONResponse(await db.get_user_settings(user_id))
 
 
 @app.post("/api/user/settings")
 async def save_settings(data: dict):
+    await _ensure_init()
     uid = data.get("user_id")
-    if not uid: raise HTTPException(400, "user_id required")
+    if not uid:
+        raise HTTPException(400, "user_id required")
     await db.upsert_user(uid)
     await db.update_user_settings(uid, data.get("settings", {}))
     return JSONResponse({"ok": True})
@@ -588,9 +581,7 @@ def _is_playlist(uri: str) -> bool:
 
 def _proxy_uri(abs_url: str, quality: str, playlist: bool) -> str:
     enc = b64enc(abs_url)
-    if playlist:
-        return f"/proxy/m3u8?url={enc}&quality={quality}"
-    return f"/proxy/seg?url={enc}"
+    return f"/proxy/m3u8?url={enc}&quality={quality}" if playlist else f"/proxy/seg?url={enc}"
 
 
 def _rewrite_m3u8(content: str, base: str, quality: str) -> str:
@@ -613,7 +604,7 @@ def _rewrite_m3u8(content: str, base: str, quality: str) -> str:
 
 @app.get("/proxy/m3u8")
 async def proxy_m3u8(url: str = Query(...), quality: str = Query("720p")):
-    decoded = b64dec(url)
+    decoded  = b64dec(url)
     m3u8_url = decoded.replace("_TPL_", quality) if "_TPL_" in decoded else decoded
     _guard(m3u8_url)
 
@@ -621,7 +612,7 @@ async def proxy_m3u8(url: str = Query(...), quality: str = Query("720p")):
     if not resp:
         raise HTTPException(502, "failed to fetch HLS playlist")
 
-    base = m3u8_url.rsplit("/", 1)[0] + "/"
+    base      = m3u8_url.rsplit("/", 1)[0] + "/"
     rewritten = _rewrite_m3u8(resp.text, base, quality)
     return Response(
         rewritten,
@@ -637,7 +628,7 @@ async def proxy_seg(url: str = Query(...)):
     hdrs = {"Referer": "https://xhamster.com/", "Origin": "https://xhamster.com"}
     try:
         async with httpx.AsyncClient(follow_redirects=False, timeout=30) as hx:
-            r = await hx.get(decoded, headers=hdrs)
+            r    = await hx.get(decoded, headers=hdrs)
             hops = 0
             while r.is_redirect and hops < 5:
                 location = r.headers.get("location", "")
@@ -645,7 +636,7 @@ async def proxy_seg(url: str = Query(...)):
                     break
                 abs_loc = location if location.startswith("http") else urljoin(decoded, location)
                 _guard(abs_loc)
-                r = await hx.get(abs_loc, headers=hdrs)
+                r    = await hx.get(abs_loc, headers=hdrs)
                 hops += 1
             if r.status_code != 200:
                 raise HTTPException(502, f"upstream {r.status_code}")
@@ -665,15 +656,17 @@ async def health():
     return JSONResponse({"status": "ok"})
 
 
-# ── Static files ──────────────────────────────────────────────────────────────
+# ── Static files (local dev only — Vercel uses public/ folder via CDN) ────────
 
-class NoCacheStaticFiles(StaticFiles):
-    async def get_response(self, path, scope):
-        response = await super().get_response(path, scope)
-        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["Expires"] = "0"
-        return response
+_IS_VERCEL = bool(os.environ.get("VERCEL"))
 
+if not _IS_VERCEL:
+    class NoCacheStaticFiles(StaticFiles):
+        async def get_response(self, path, scope):
+            response = await super().get_response(path, scope)
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"]         = "no-cache"
+            response.headers["Expires"]        = "0"
+            return response
 
-app.mount("/", NoCacheStaticFiles(directory="static", html=True), name="static")
+    app.mount("/", NoCacheStaticFiles(directory="static", html=True), name="static")
