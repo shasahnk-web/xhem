@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+httpx
+aiosqlite
+selectolax
+chompjs
+eaf-base-api
+m3u8
+curl_cffi
+python-multipart
