@@ -1,0 +1,3 @@
+- [xHamster extractor fix](xh-extractor.md) — DOM CSS selectors are dead; data lives in window.initials JSON under searchResult.videoThumbProps.
+- [xhamster_api Video constructor slots](xh-video-slots.md) — Video uses slots=True; extractor dict must contain ONLY known dataclass field names or __init__ crashes.
+- [xhamster_api lazy Video attrs](xh-video-lazy-attrs.md) — accessing views/likes/tags/etc. on a get_video() result can raise DataNotLoadedError; always use a safe getter.

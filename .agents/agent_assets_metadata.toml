@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "RrY8h3Wcz8Gq4X51op9yx"
+uri = "file://arch-tech-by-shashank.zip"
+type = "unspecified"
+title = "Arch Tech By Shashank — Source Code"
